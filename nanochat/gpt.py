@@ -241,19 +241,35 @@ class GPT(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', visual_embs=None):
         B, T = idx.size()
 
+        # Optional vision prefix tokens (e.g. from an image encoder)
+        prefix_len = 0
+        if visual_embs is not None:
+            # visual_embs: (B, prefix_len, n_embd)
+            assert kv_cache is None, "visual_embs is not supported together with kv_cache yet"
+            assert visual_embs.dim() == 3, f"visual_embs must be 3D, got {visual_embs.dim()}D"
+            assert visual_embs.size(0) == B, f"visual_embs batch {visual_embs.size(0)} != idx batch {B}"
+            assert visual_embs.size(2) == self.config.n_embd, f"visual_embs dim {visual_embs.size(2)} != n_embd {self.config.n_embd}"
+            prefix_len = visual_embs.size(1)
+
+        S = T + prefix_len  # total sequence length seen by the Transformer
+
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
-        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        assert S <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {S} > {self.cos.size(1)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        cos_sin = self.cos[:, T0:T0+S], self.sin[:, T0:T0+S] # truncate cache to current sequence length
 
         # Forward the trunk of the Transformer
-        x = self.transformer.wte(idx)
+        tok_emb = self.transformer.wte(idx)
+        if visual_embs is not None:
+            x = torch.cat([visual_embs, tok_emb], dim=1)
+        else:
+            x = tok_emb
         x = norm(x)
         for block in self.transformer.h:
             x = block(x, cos_sin, kv_cache)
@@ -267,7 +283,17 @@ class GPT(nn.Module):
             logits = self.lm_head(x)
             logits = softcap * torch.tanh(logits / softcap) # logits softcap
             logits = logits.float() # use tf32/fp32 for logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if visual_embs is not None and prefix_len > 0:
+                pad = torch.full((B, prefix_len), -1, dtype=targets.dtype, device=targets.device)
+                targets_full = torch.cat([pad, targets], dim=1)
+            else:
+                targets_full = targets
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets_full.view(-1),
+                ignore_index=-1,
+                reduction=loss_reduction,
+            )
             return loss
         else:
             # inference mode: compute and return the logits
