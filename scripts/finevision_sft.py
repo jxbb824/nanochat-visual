@@ -34,23 +34,23 @@ from tasks.finevision import FineVision
 # Basic settings (keep minimal for now)
 
 run = "dummy"  # wandb run name default ("dummy" is special - we won't log to wandb)
-source = "sft"  # base|mid|sft|rl, we load the released d34 chat model
-model_tag = "d34"  # default to the released d34 chat model
+source = "sft"  # base|mid|sft|rl, default to SFT checkpoint
+model_tag = "d20"  # default to the released d20 chat model
 step = None
 device_type = ""  # cuda|cpu|mps (empty => autodetect)
 dtype = "bfloat16"
-device_batch_size = 2  # small default for quick experiments
+device_batch_size = 4  # small default for quick experiments
 # only use a subset of FineVision for quicker experiments
-max_examples = 20000
+max_examples = 200000
 # vision encoder hyperparameters
 vision_model_name = "ViT-B-32"
 vision_pretrained = "openai"
-vision_num_tokens = 16
+vision_num_tokens = 64
 vision_lr = 1e-4
 vision_weight_decay = 0.01
 # training loop
-num_iterations = 10000
-save_every = 1000
+num_iterations = 50000
+save_every = 50000
 resume_from_step = -1
 
 # now allow CLI to override the settings via the configurator
@@ -72,9 +72,20 @@ use_dummy_wandb = run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-finevision", name=run, config=user_config)
 
 model, tokenizer, meta = load_model(source, device, phase="train", model_tag=model_tag, step=step)
+# freeze all params, then selectively unfreeze a small tail of the model
 for p in model.parameters():
     p.requires_grad = False
-model.eval()
+
+# unfreeze last few transformer blocks + lm_head for joint training
+llm_unfreeze_layers = 4
+unfreeze = min(llm_unfreeze_layers, model.config.n_layer)
+for block in model.transformer.h[-unfreeze:]:
+    for p in block.parameters():
+        p.requires_grad = True
+for p in model.lm_head.parameters():
+    p.requires_grad = True
+
+model.train()
 
 
 # -----------------------------------------------------------------------------
@@ -124,7 +135,16 @@ def finevision_data_generator(dataset, batch_size):
     while True:
         for i in range(ddp_rank, len(dataset), ddp_world_size):
             doc = dataset[i]
-            ids, mask = tokenizer.render_conversation(doc)
+            try:
+                ids, mask = tokenizer.render_conversation(doc)
+            except Exception as e:
+                # Be robust to any bad conversations: skip and continue training
+                if master_process:
+                    print0(f"Skipping FineVision example {i} due to tokenization error: {e}")
+                continue
+            if len(ids) < 2:
+                # too short to form inputs/targets
+                continue
             images = doc.get("images", None)
             batch.append((ids, mask, images))
             if len(batch) == batch_size:
@@ -136,7 +156,7 @@ train_loader = finevision_data_generator(train_ds, batch_size=device_batch_size)
 
 
 # -----------------------------------------------------------------------------
-# Vision encoder and optimizer
+# Vision encoder and optimizers
 
 vision = CLIPVisionPrefixEncoder(
     d_model=model.config.n_embd,
@@ -147,7 +167,18 @@ vision = CLIPVisionPrefixEncoder(
 ).to(device)
 vision.train()
 
-optimizer = torch.optim.AdamW(
+# separate optimizers for LLM tail and vision encoder
+llm_lr = 5e-4
+llm_weight_decay = 0.0
+
+llm_params = [p for p in model.parameters() if p.requires_grad]
+llm_optimizer = torch.optim.AdamW(
+    llm_params,
+    lr=llm_lr,
+    weight_decay=llm_weight_decay,
+)
+
+vision_optimizer = torch.optim.AdamW(
     vision.parameters(),
     lr=vision_lr,
     weight_decay=vision_weight_decay,
@@ -169,21 +200,24 @@ def build_image_batch(images_batch):
 
 
 # -----------------------------------------------------------------------------
-# Checkpoint helpers
+# Checkpoint helpers (joint GPT + vision)
 
 base_dir = get_base_dir()
-vision_ckpt_dir = os.path.join(base_dir, "finevision_checkpoints", model_tag)
-os.makedirs(vision_ckpt_dir, exist_ok=True)
+vlm_tag = f"{model_tag}_finevision"
+vlm_ckpt_dir = os.path.join(base_dir, "vlm_checkpoints", vlm_tag)
+os.makedirs(vlm_ckpt_dir, exist_ok=True)
 
 start_step = 0
 if resume_from_step >= 0:
-    vision_state, optim_state, meta_ckpt = load_checkpoint(
-        vision_ckpt_dir, resume_from_step, device, load_optimizer=True, rank=ddp_rank
-    )
-    vision.load_state_dict(vision_state)
-    optimizer.load_state_dict(optim_state)
-    start_step = resume_from_step
-    print0(f"Resuming FineVision training from step {resume_from_step}")
+    ckpt_path = os.path.join(vlm_ckpt_dir, f"vlm_{resume_from_step:06d}.pt")
+    if os.path.exists(ckpt_path):
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        vision.load_state_dict(ckpt["vision_state"])
+        llm_optimizer.load_state_dict(ckpt["optim_state"]["llm"])
+        vision_optimizer.load_state_dict(ckpt["optim_state"]["vision"])
+        start_step = ckpt["step"] + 1
+        print0(f"Resuming FineVision training from step {ckpt['step']}")
 
 
 # -----------------------------------------------------------------------------
@@ -201,9 +235,11 @@ for step in range(start_step, num_iterations):
         visual_tokens = vision(images_tensor)
         loss = model(inputs, targets, visual_embs=visual_tokens)
 
-    optimizer.zero_grad(set_to_none=True)
+    llm_optimizer.zero_grad(set_to_none=True)
+    vision_optimizer.zero_grad(set_to_none=True)
     loss.backward()
-    optimizer.step()
+    llm_optimizer.step()
+    vision_optimizer.step()
 
     loss_item = loss.item()
     print0(f"Step {step:05d}/{num_iterations:05d} | loss: {loss_item:.6f}")
@@ -215,19 +251,19 @@ for step in range(start_step, num_iterations):
     )
 
     if last_step or (save_every > 0 and step > 0 and step % save_every == 0):
-        save_checkpoint(
-            vision_ckpt_dir,
-            step,
-            vision.state_dict(),
-            optimizer.state_dict(),
-            {
-                "step": step,
-                "model_tag": model_tag,
-                "vision_num_tokens": vision_num_tokens,
-                "user_config": user_config,
+        ckpt = {
+            "step": step,
+            "model_state": model.state_dict(),
+            "vision_state": vision.state_dict(),
+            "model_config": meta["model_config"],
+            "user_config": user_config,
+            "optim_state": {
+                "llm": llm_optimizer.state_dict(),
+                "vision": vision_optimizer.state_dict(),
             },
-            rank=ddp_rank,
-        )
+        }
+        ckpt_path = os.path.join(vlm_ckpt_dir, f"vlm_{step:06d}.pt")
+        torch.save(ckpt, ckpt_path)
 
     if last_step:
         break

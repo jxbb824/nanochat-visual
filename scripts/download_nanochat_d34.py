@@ -2,8 +2,8 @@
 Download the released nanochat d34 chat model from Hugging Face and place
 its files into the directories expected by nanochat.
 
-This follows the instructions from the author:
-- token_bytes.pt, tokenizer.pkl -> ~/.cache/nanochat/tokenizer
+This follows the instructions from the author (slightly adapted):
+- token_bytes.pt, tokenizer.pkl -> ~/.cache/nanochat/tokenizer/d34
 - meta_169150.json, model_169150.pt -> ~/.cache/nanochat/chatsft_checkpoints/d34/
 
 Model card: https://huggingface.co/karpathy/nanochat-d34
@@ -29,7 +29,8 @@ def main():
     )
 
     # Target locations:
-    tokenizer_dir = os.path.join(base_dir, "tokenizer")
+    # tokenizer is stored under tokenizer/d34 so multiple tokenizers can coexist
+    tokenizer_dir = os.path.join(base_dir, "tokenizer", "d34")
     os.makedirs(tokenizer_dir, exist_ok=True)
     chatsft_dir = os.path.join(base_dir, "chatsft_checkpoints", "d34")
     os.makedirs(chatsft_dir, exist_ok=True)

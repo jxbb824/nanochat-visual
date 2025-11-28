@@ -22,17 +22,19 @@ if [ -z "$WANDB_RUN" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Download the released d34 chat model + tokenizer from Hugging Face
-# Only if it isn't already present, to avoid overwriting any existing d34.
+# Download the nanochat-d20 run from Hugging Face
+# Only if it isn't already present.
 
-CHAT_DIR="$NANOCHAT_BASE_DIR/chatsft_checkpoints/d34"
-TOKENIZER_DIR="$NANOCHAT_BASE_DIR/tokenizer"
+CHAT_DIR="$NANOCHAT_BASE_DIR/chatsft_checkpoints/d20"
 
-if [ ! -f "$CHAT_DIR/model_169150.pt" ] || [ ! -f "$CHAT_DIR/meta_169150.json" ]; then
-    python -m scripts.download_nanochat_d34
+if [ ! -d "$CHAT_DIR" ]; then
+    python -m scripts.download_nanochat_d20
 else
-    echo "Found existing d34 checkpoint in $CHAT_DIR, skipping download."
+    echo "Found existing d20 checkpoints in $CHAT_DIR, skipping download."
 fi
+
+# Use tokenizer specific to d20 (can be overridden by user)
+export NANOCHAT_TOKENIZER_DIR="$NANOCHAT_BASE_DIR/tokenizer/d20"
 
 # -----------------------------------------------------------------------------
 # Prepare FineVision local parquet subset (only once)
@@ -49,6 +51,6 @@ fi
 # Run FineVision finetuning
 
 NPROC_PER_NODE=2
-torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.finevision_sft -- --run=$WANDB_RUN --device_batch_size=2
+torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.finevision_sft -- --run=$WANDB_RUN --device_batch_size=6
 
 

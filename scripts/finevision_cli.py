@@ -13,28 +13,44 @@ from PIL import Image
 from contextlib import nullcontext
 
 from nanochat.common import compute_init, autodetect_device_type, get_base_dir
-from nanochat.checkpoint_manager import load_model, load_checkpoint, find_last_step
+from nanochat.gpt import GPT, GPTConfig
 from nanochat.vision import CLIPVisionPrefixEncoder
 
 
-def build_visual_encoder(model, device, num_tokens=16, model_name="ViT-B-32", pretrained="openai"):
+def load_vlm_checkpoint(device, vlm_tag="d20_finevision"):
+    """
+    Load the jointly finetuned VLM (GPT + vision) from vlm_checkpoints.
+    """
+    base_dir = get_base_dir()
+    vlm_ckpt_dir = os.path.join(base_dir, "vlm_checkpoints", vlm_tag)
+    assert os.path.isdir(vlm_ckpt_dir), f"VLM checkpoints not found at {vlm_ckpt_dir}"
+
+    ckpt_files = [f for f in os.listdir(vlm_ckpt_dir) if f.startswith("vlm_") and f.endswith(".pt")]
+    assert ckpt_files, f"No vlm_*.pt checkpoints found in {vlm_ckpt_dir}"
+    last_step = max(int(f[4:10]) for f in ckpt_files)
+    ckpt_path = os.path.join(vlm_ckpt_dir, f"vlm_{last_step:06d}.pt")
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    model_config = GPTConfig(**ckpt["model_config"])
+    with torch.device("meta"):
+        model = GPT(model_config)
+    model.to_empty(device=device)
+    model.init_weights()
+    model.load_state_dict(ckpt["model_state"], strict=True, assign=True)
+    model.eval()
+
     vision = CLIPVisionPrefixEncoder(
         d_model=model.config.n_embd,
-        num_tokens=num_tokens,
-        model_name=model_name,
-        pretrained=pretrained,
+        num_tokens=ckpt["user_config"].get("vision_num_tokens", 64),
+        model_name=ckpt["user_config"].get("vision_model_name", "ViT-B-32"),
+        pretrained=ckpt["user_config"].get("vision_pretrained", "openai"),
         device=device,
     ).to(device)
-
-    # load vision weights if available
-    base_dir = get_base_dir()
-    vision_ckpt_dir = os.path.join(base_dir, "finevision_checkpoints", "d34")
-    if os.path.isdir(vision_ckpt_dir):
-        step = find_last_step(vision_ckpt_dir)
-        state_dict, _, _ = load_checkpoint(vision_ckpt_dir, step, device, load_optimizer=False, rank=0)
-        vision.load_state_dict(state_dict, strict=True)
+    vision.load_state_dict(ckpt["vision_state"], strict=True)
     vision.eval()
-    return vision
+
+    return model, vision
 
 
 def build_visual_tokens(vision, image_path, device):
@@ -97,8 +113,10 @@ def main():
     ptdtype = torch.float32 if args.dtype == "float32" else torch.bfloat16
     autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
 
-    model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag="d34")
-    vision = build_visual_encoder(model, device)
+    from nanochat.tokenizer import get_tokenizer
+
+    tokenizer = get_tokenizer()
+    model, vision = load_vlm_checkpoint(device, vlm_tag="d20_finevision")
 
     with autocast_ctx:
         visual_tokens = build_visual_tokens(vision, args.image, device)

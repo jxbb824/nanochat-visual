@@ -58,6 +58,30 @@ def get_base_dir():
     os.makedirs(nanochat_dir, exist_ok=True)
     return nanochat_dir
 
+def get_tokenizer_dir():
+    """
+    Return the directory where the tokenizer artifacts live.
+    By default this is <base_dir>/tokenizer, but it can be overridden
+    by setting the NANOCHAT_TOKENIZER_DIR environment variable.
+    """
+    override = os.environ.get("NANOCHAT_TOKENIZER_DIR")
+    if override:
+        return override
+
+    base_dir = get_base_dir()
+    root = os.path.join(base_dir, "tokenizer")
+
+    # Simple rule: either user specifies NANOCHAT_TOKENIZER_DIR,
+    # or we expect a single tokenizer.pkl directly under tokenizer/.
+    if os.path.exists(os.path.join(root, "tokenizer.pkl")):
+        return root
+
+    raise RuntimeError(
+        "Tokenizer directory not found. Either:\n"
+        f"- place tokenizer.pkl under {root}, or\n"
+        "- set NANOCHAT_TOKENIZER_DIR to the desired tokenizer directory."
+    )
+
 def download_file_with_lock(url, filename, postprocess_fn=None):
     """
     Downloads a file from a URL to a local path in the base directory.

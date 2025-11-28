@@ -48,12 +48,14 @@ class FineVision(Task):
 
         messages = []
         for turn in texts:
-            user = turn.get("user", None)
-            assistant = turn.get("assistant", None)
-            if user is not None and len(user) > 0:
-                messages.append({"role": "user", "content": user})
-            if assistant is not None and len(assistant) > 0:
-                messages.append({"role": "assistant", "content": assistant})
+            # we require strict user/assistant pairs for render_conversation
+            user = (turn.get("user") or "").strip()
+            assistant = (turn.get("assistant") or "").strip()
+            if not user or not assistant:
+                # skip incomplete turns that would break user/assistant alternation
+                continue
+            messages.append({"role": "user", "content": user})
+            messages.append({"role": "assistant", "content": assistant})
 
         assert len(messages) >= 2, "FineVision conversation must have at least one user/assistant pair"
 
