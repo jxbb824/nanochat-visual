@@ -28,6 +28,16 @@ from nanochat.common import (
 from nanochat.checkpoint_manager import load_model, save_checkpoint, load_checkpoint
 from nanochat.vision import CLIPVisionPrefixEncoder
 from tasks.finevision import FineVision
+from tasks.mmstar import MMStar
+from tasks.mme import MME
+from scripts.mmstar_eval import (
+    build_visual_tokens as mmstar_build_visual_tokens,
+    generate_answer as mmstar_generate_answer,
+)
+from scripts.mme_eval import (
+    build_visual_tokens as mme_build_visual_tokens,
+    generate_answer as mme_generate_answer,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -52,6 +62,10 @@ vision_weight_decay = 0.01
 num_iterations = 50000
 save_every = 50000
 resume_from_step = -1
+# vision eval
+vis_eval_every = 500
+mmstar_eval_examples = 200
+mme_eval_examples = 200
 
 # now allow CLI to override the settings via the configurator
 config_keys = [k for k, v in globals().items() if not k.startswith("_") and isinstance(v, (int, float, bool, str))]
@@ -72,19 +86,6 @@ use_dummy_wandb = run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-finevision", name=run, config=user_config)
 
 model, tokenizer, meta = load_model(source, device, phase="train", model_tag=model_tag, step=step)
-# freeze all params, then selectively unfreeze a small tail of the model
-for p in model.parameters():
-    p.requires_grad = False
-
-# unfreeze last few transformer blocks + lm_head for joint training
-llm_unfreeze_layers = 4
-unfreeze = min(llm_unfreeze_layers, model.config.n_layer)
-for block in model.transformer.h[-unfreeze:]:
-    for p in block.parameters():
-        p.requires_grad = True
-for p in model.lm_head.parameters():
-    p.requires_grad = True
-
 model.train()
 
 
@@ -200,6 +201,79 @@ def build_image_batch(images_batch):
 
 
 # -----------------------------------------------------------------------------
+# Vision benchmark evaluation helpers (MMStar + MME)
+
+def evaluate_mmstar(model, vision, tokenizer, device, autocast_ctx, max_examples):
+    ds = MMStar()
+    n = len(ds) if max_examples <= 0 else min(len(ds), max_examples)
+    was_training_model = model.training
+    was_training_vision = vision.training
+    model.eval()
+    vision.eval()
+    num_correct, total = 0, 0
+    with torch.no_grad(), autocast_ctx:
+        for idx in range(n):
+            conversation = ds[idx]
+            image = conversation["mmstar_image"]
+            question = conversation["messages"][0]["content"]
+            visual_tokens = mmstar_build_visual_tokens(vision, image, device)
+            pred = mmstar_generate_answer(
+                model,
+                tokenizer,
+                question,
+                visual_tokens,
+                device,
+                max_tokens=32,
+                temperature=0.0,
+                top_k=None,
+            )
+            ok = ds.evaluate(conversation, pred)
+            num_correct += int(ok)
+            total += 1
+    acc = float(num_correct) / total if total > 0 else 0.0
+    if was_training_model:
+        model.train()
+    if was_training_vision:
+        vision.train()
+    return acc
+
+
+def evaluate_mme(model, vision, tokenizer, device, autocast_ctx, max_examples):
+    ds = MME()
+    n = len(ds) if max_examples <= 0 else min(len(ds), max_examples)
+    was_training_model = model.training
+    was_training_vision = vision.training
+    model.eval()
+    vision.eval()
+    num_correct, total = 0, 0
+    with torch.no_grad(), autocast_ctx:
+        for idx in range(n):
+            conversation = ds[idx]
+            image = conversation["mme_image"]
+            question = conversation["messages"][0]["content"]
+            visual_tokens = mme_build_visual_tokens(vision, image, device)
+            pred = mme_generate_answer(
+                model,
+                tokenizer,
+                question,
+                visual_tokens,
+                device,
+                max_tokens=8,
+                temperature=0.0,
+                top_k=None,
+            )
+            ok = ds.evaluate(conversation, pred)
+            num_correct += int(ok)
+            total += 1
+    acc = float(num_correct) / total if total > 0 else 0.0
+    if was_training_model:
+        model.train()
+    if was_training_vision:
+        vision.train()
+    return acc
+
+
+# -----------------------------------------------------------------------------
 # Checkpoint helpers (joint GPT + vision)
 
 base_dir = get_base_dir()
@@ -249,6 +323,18 @@ for step in range(start_step, num_iterations):
             "train/loss": loss_item,
         }
     )
+
+    # periodic visual benchmark evaluation (MMStar + MME)
+    if master_process and (last_step or (vis_eval_every > 0 and step > 0 and step % vis_eval_every == 0)):
+        mmstar_acc = evaluate_mmstar(model, vision, tokenizer, device, autocast_ctx, mmstar_eval_examples)
+        mme_acc = evaluate_mme(model, vision, tokenizer, device, autocast_ctx, mme_eval_examples)
+        wandb_run.log(
+            {
+                "step": step,
+                "mmstar/acc": mmstar_acc,
+                "mme/acc": mme_acc,
+            }
+        )
 
     if last_step or (save_every > 0 and step > 0 and step % save_every == 0):
         ckpt = {
