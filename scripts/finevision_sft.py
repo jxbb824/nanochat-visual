@@ -26,7 +26,11 @@ from nanochat.common import (
     get_base_dir,
 )
 from nanochat.checkpoint_manager import load_model, save_checkpoint, load_checkpoint
-from nanochat.vision import CLIPVisionPrefixEncoder
+from nanochat.vision import (
+    CLIPVisionPrefixEncoder,
+    CLIPPatchVisionPrefixEncoder,
+    PatchVisionPrefixEncoder,
+)
 from tasks.finevision import FineVision
 from tasks.mmstar import MMStar
 from tasks.mme import MME
@@ -56,6 +60,17 @@ max_examples = 200000
 vision_model_name = "ViT-B-32"
 vision_pretrained = "openai"
 vision_num_tokens = 64
+# vision encoder type:
+# - "clip_global"  -> CLIPVisionPrefixEncoder (global image embedding)
+# - "clip_patch"   -> CLIPPatchVisionPrefixEncoder (CLIP ViT patch tokens)
+# - "patch"        -> PatchVisionPrefixEncoder (learned Conv2d patch embedding)
+vision_encoder_type = "clip_global"
+# patch-based encoder hyperparameters
+# - for "clip_patch": only `vision_pool` is used (spatial pooling over CLIP patches)
+# - for "patch": all three are used (image_size, patch_size, pool)
+vision_image_size = 224
+vision_patch_size = 16
+vision_pool = 2
 vision_lr = 1e-4
 vision_weight_decay = 0.01
 # training loop
@@ -66,6 +81,9 @@ resume_from_step = -1
 vis_eval_every = 500
 mmstar_eval_examples = 200
 mme_eval_examples = 200
+#
+# checkpoint naming: final directory is f"{model_tag}_{vlm_tag_suffix}"
+vlm_tag_suffix = "finevision"
 
 # now allow CLI to override the settings via the configurator
 config_keys = [k for k, v in globals().items() if not k.startswith("_") and isinstance(v, (int, float, bool, str))]
@@ -159,17 +177,60 @@ train_loader = finevision_data_generator(train_ds, batch_size=device_batch_size)
 # -----------------------------------------------------------------------------
 # Vision encoder and optimizers
 
-vision = CLIPVisionPrefixEncoder(
-    d_model=model.config.n_embd,
-    num_tokens=vision_num_tokens,
-    model_name=vision_model_name,
-    pretrained=vision_pretrained,
-    device=device,
-).to(device)
+if vision_encoder_type == "clip_global":
+    vision = CLIPVisionPrefixEncoder(
+        d_model=model.config.n_embd,
+        num_tokens=vision_num_tokens,
+        model_name=vision_model_name,
+        pretrained=vision_pretrained,
+        device=device,
+    ).to(device)
+elif vision_encoder_type == "clip_patch":
+    vision = CLIPPatchVisionPrefixEncoder(
+        d_model=model.config.n_embd,
+        model_name=vision_model_name,
+        pretrained=vision_pretrained,
+        pool=vision_pool,
+        device=device,
+    ).to(device)
+    vision_num_tokens = getattr(vision, "num_tokens", vision_num_tokens)
+    user_config["vision_model_name"] = vision_model_name
+    user_config["vision_pretrained"] = vision_pretrained
+    user_config["vision_pool"] = vision_pool
+elif vision_encoder_type == "patch":
+    vision = PatchVisionPrefixEncoder(
+        d_model=model.config.n_embd,
+        image_size=vision_image_size,
+        patch_size=vision_patch_size,
+        pool=vision_pool,
+    ).to(device)
+    # align logical num_tokens with the encoder for logging/checkpointing
+    vision_num_tokens = getattr(vision, "num_tokens", vision_num_tokens)
+    user_config["vision_image_size"] = vision_image_size
+    user_config["vision_patch_size"] = vision_patch_size
+    user_config["vision_pool"] = vision_pool
+else:
+    raise ValueError(f"Unsupported vision_encoder_type: {vision_encoder_type}")
+
+# make sure user_config reflects the actual encoder settings
+user_config["vision_encoder_type"] = vision_encoder_type
+user_config["vision_num_tokens"] = vision_num_tokens
+
+# If the user did not override the suffix explicitly, derive a more descriptive one
+if vlm_tag_suffix == "finevision":
+    if vision_encoder_type == "clip_global":
+        vlm_tag_suffix = "finevision_clip"
+    elif vision_encoder_type == "clip_patch":
+        safe_name = str(vision_model_name).replace("/", "-")
+        vlm_tag_suffix = f"finevision_clippatch_{safe_name}_pool{vision_pool}"
+    elif vision_encoder_type == "patch":
+        vlm_tag_suffix = f"finevision_patch_i{vision_image_size}_p{vision_patch_size}_pool{vision_pool}"
+user_config["vlm_tag_suffix"] = vlm_tag_suffix
+
 vision.train()
 
 # separate optimizers for LLM tail and vision encoder
-llm_lr = 5e-4
+llm_lr = 1e-5
 llm_weight_decay = 0.0
 
 llm_params = [p for p in model.parameters() if p.requires_grad]
@@ -195,7 +256,9 @@ def build_image_batch(images_batch):
             img = images[0]
             if not isinstance(img, Image.Image):
                 img = Image.fromarray(img)
-        t = vision.preprocess(img)  # CLIP preprocess -> (3, H, W)
+        # ensure 3-channel RGB before preprocessing (some images may be RGBA or grayscale)
+        img = img.convert("RGB")
+        t = vision.preprocess(img)  # preprocess -> (3, H, W)
         tensors.append(t)
     return torch.stack(tensors, dim=0).to(device)
 
@@ -277,7 +340,7 @@ def evaluate_mme(model, vision, tokenizer, device, autocast_ctx, max_examples):
 # Checkpoint helpers (joint GPT + vision)
 
 base_dir = get_base_dir()
-vlm_tag = f"{model_tag}_finevision"
+vlm_tag = f"{model_tag}_{vlm_tag_suffix}"
 vlm_ckpt_dir = os.path.join(base_dir, "vlm_checkpoints", vlm_tag)
 os.makedirs(vlm_ckpt_dir, exist_ok=True)
 

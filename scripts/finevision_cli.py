@@ -14,7 +14,7 @@ from contextlib import nullcontext
 
 from nanochat.common import compute_init, autodetect_device_type, get_base_dir
 from nanochat.gpt import GPT, GPTConfig
-from nanochat.vision import CLIPVisionPrefixEncoder
+from nanochat.vision import CLIPVisionPrefixEncoder, CLIPPatchVisionPrefixEncoder, PatchVisionPrefixEncoder
 
 
 def load_vlm_checkpoint(device, vlm_tag="d20_finevision"):
@@ -40,13 +40,34 @@ def load_vlm_checkpoint(device, vlm_tag="d20_finevision"):
     model.load_state_dict(ckpt["model_state"], strict=True, assign=True)
     model.eval()
 
-    vision = CLIPVisionPrefixEncoder(
-        d_model=model.config.n_embd,
-        num_tokens=ckpt["user_config"].get("vision_num_tokens", 64),
-        model_name=ckpt["user_config"].get("vision_model_name", "ViT-B-32"),
-        pretrained=ckpt["user_config"].get("vision_pretrained", "openai"),
-        device=device,
-    ).to(device)
+    user_config = ckpt.get("user_config", {})
+    vision_encoder_type = user_config.get("vision_encoder_type", "clip_global")
+
+    if vision_encoder_type == "clip_global":
+        vision = CLIPVisionPrefixEncoder(
+            d_model=model.config.n_embd,
+            num_tokens=user_config.get("vision_num_tokens", 64),
+            model_name=user_config.get("vision_model_name", "ViT-B-32"),
+            pretrained=user_config.get("vision_pretrained", "openai"),
+            device=device,
+        ).to(device)
+    elif vision_encoder_type == "clip_patch":
+        vision = CLIPPatchVisionPrefixEncoder(
+            d_model=model.config.n_embd,
+            model_name=user_config.get("vision_model_name", "ViT-B-32"),
+            pretrained=user_config.get("vision_pretrained", "openai"),
+            pool=user_config.get("vision_pool", 1),
+            device=device,
+        ).to(device)
+    elif vision_encoder_type == "patch":
+        vision = PatchVisionPrefixEncoder(
+            d_model=model.config.n_embd,
+            image_size=user_config.get("vision_image_size", 224),
+            patch_size=user_config.get("vision_patch_size", 16),
+            pool=user_config.get("vision_pool", 2),
+        ).to(device)
+    else:
+        raise ValueError(f"Unsupported vision_encoder_type in checkpoint: {vision_encoder_type}")
     vision.load_state_dict(ckpt["vision_state"], strict=True)
     vision.eval()
 
@@ -102,6 +123,7 @@ def main():
     parser = argparse.ArgumentParser(description="FineVision CLI")
     parser.add_argument("-i", "--image", type=str, required=True, help="Path to the image file")
     parser.add_argument("-q", "--question", type=str, required=True, help="User question about the image")
+    parser.add_argument("--vlm-tag", type=str, default="d20_finevision", help="VLM checkpoint tag under vlm_checkpoints/")
     parser.add_argument("--device-type", type=str, default="", choices=["cuda", "cpu", "mps"], help="Device type")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
     args = parser.parse_args()
@@ -116,7 +138,7 @@ def main():
     from nanochat.tokenizer import get_tokenizer
 
     tokenizer = get_tokenizer()
-    model, vision = load_vlm_checkpoint(device, vlm_tag="d20_finevision")
+    model, vision = load_vlm_checkpoint(device, vlm_tag=args.vlm_tag)
 
     with autocast_ctx:
         visual_tokens = build_visual_tokens(vision, args.image, device)

@@ -29,6 +29,11 @@ if [ -z "$WANDB_RUN" ]; then
     WANDB_RUN=d10_finevision
 fi
 
+# More descriptive VLM tag for the CLIP-based patch encoder setup
+# Note: ViT-B-32 has 7x7=49 patches, so pool must be 1 or 7 (7 is divisible by 1 and 7 only)
+VLM_TAG_SUFFIX=finevision_clippatch_ViT-B-32_pool1_fixed
+VLM_TAG="d10_${VLM_TAG_SUFFIX}"
+
 # -----------------------------------------------------------------------------
 # Download the nanochat-d10 base run from Hugging Face (if not already present)
 
@@ -62,12 +67,15 @@ torchrun --standalone --nproc_per_node=$NPROC_PER_NODE \
   --run="$WANDB_RUN" \
   --source=base \
   --model_tag=d10 \
-  --device_batch_size=12 \
+  --vlm_tag_suffix="$VLM_TAG_SUFFIX" \
+  --vision_encoder_type=clip_patch \
+  --vision_pool=1 \
+  --device_batch_size=16 \
   --num_iterations=20000
 
 # -----------------------------------------------------------------------------
 
-python -m scripts.mmstar_eval --vlm-tag=d10_finevision --device-type=cuda
-python -m scripts.mme_eval    --vlm-tag=d10_finevision --device-type=cuda
+python -m scripts.mmstar_eval --vlm-tag="$VLM_TAG" --device-type=cuda
+python -m scripts.mme_eval    --vlm-tag="$VLM_TAG" --device-type=cuda
 
 
