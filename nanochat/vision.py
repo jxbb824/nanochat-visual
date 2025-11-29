@@ -192,11 +192,17 @@ class CLIPPatchVisionPrefixEncoder(nn.Module):
             x = x + pos_embed
         else:
             raise ValueError(f"Unsupported positional_embedding shape: {pos_embed.shape}")
+        if hasattr(visual, "patch_dropout"):
+            x = visual.patch_dropout(x)
         x = visual.ln_pre(x)
 
-        x = x.permute(1, 0, 2)  # N, B, C
-        x = visual.transformer(x)
-        x = x.permute(1, 0, 2)  # B, N, C
+        attn_mask = getattr(visual, "attn_mask", None)
+        if getattr(visual.transformer, "batch_first", True):
+            x = visual.transformer(x, attn_mask=attn_mask)  # (B, N, C)
+        else:
+            x = x.permute(1, 0, 2)  # N, B, C
+            x = visual.transformer(x, attn_mask=attn_mask)
+            x = x.permute(1, 0, 2)  # B, N, C
 
         # Apply post layer norm (critical for stable features!)
         # CLIP ViT applies ln_post after transformer; without this the features
@@ -302,5 +308,4 @@ class PatchVisionPrefixEncoder(nn.Module):
         B, C, H, W = x.shape
         x = x.view(B, C, H * W).transpose(1, 2)  # (B, num_tokens, d_model)
         return x
-
 

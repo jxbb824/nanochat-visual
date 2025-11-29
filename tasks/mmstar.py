@@ -9,6 +9,8 @@ We use the `val` split, which has 1.5K examples with columns:
 - category, l2_category, meta_info: extra metadata (ignored here)
 """
 
+import re
+import string
 from typing import Any
 
 from datasets import load_dataset
@@ -52,6 +54,7 @@ class MMStar(Task):
             # keep raw metadata for evaluation
             "mmstar_image": image,
             "mmstar_answer": answer,
+            "mmstar_question": q.strip(),  # save original question for option extraction
         }
         return conversation
 
@@ -59,7 +62,7 @@ class MMStar(Task):
         """
         Evaluate a completion against the ground truth.
         For multiple choice, we accept either the correct letter (A/B/...)
-        or the exact option text (case-insensitive, stripped).
+        or if any word from the correct option content appears in the completion.
         """
         gt = str(problem["mmstar_answer"]).strip()
         completion = (completion or "").strip()
@@ -70,14 +73,41 @@ class MMStar(Task):
         gt_norm = gt.lower()
         comp_norm = completion.lower()
 
-        # if ground truth is a single letter, only check the first non-space char
+        # if ground truth is a single letter, check both letter and option content
         if len(gt_norm) == 1 and gt_norm.isalpha():
+            # First, check if the letter appears in completion
             first_char = None
             for ch in comp_norm:
                 if ch.isalpha():
                     first_char = ch
                     break
-            return first_char == gt_norm
+            if first_char == gt_norm:
+                return True
+            
+            # If letter doesn't match, check if any word from the option content appears
+            question = problem.get("mmstar_question", "")
+            if question:
+                # Extract option content for the correct answer letter
+                # Pattern: "A: content" or "A. content" or "A) content"
+                question_lower = question.lower()
+                gt_letter_lower = gt_norm.lower()
+                
+                # Match pattern like "A: content" until next option or end
+                pattern = rf"\b{gt_letter_lower}[:\s\.\)]\s*(.+?)(?=\s*(?:[A-D][:\s\.\)]|$))"
+                match = re.search(pattern, question_lower, re.IGNORECASE | re.DOTALL)
+                
+                if match:
+                    option_content = match.group(1).strip()
+                    if option_content:
+                        option_content_clean = option_content.translate(str.maketrans('', '', string.punctuation))
+                        option_words = [w.lower() for w in option_content_clean.split() if len(w) >= 1]
+                        
+                        # Check if any word from the option appears in completion
+                        for word in option_words:
+                            if word in comp_norm:
+                                return True
+            
+            return False
 
         # otherwise, check if gt text appears in completion
         return gt_norm in comp_norm

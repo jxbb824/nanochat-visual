@@ -32,6 +32,7 @@ from nanochat.vision import (
     PatchVisionPrefixEncoder,
 )
 from tasks.finevision import FineVision
+from tasks.cauldron import Cauldron
 from tasks.mmstar import MMStar
 from tasks.mme import MME
 from scripts.mmstar_eval import (
@@ -54,8 +55,14 @@ step = None
 device_type = ""  # cuda|cpu|mps (empty => autodetect)
 dtype = "bfloat16"
 device_batch_size = 4  # small default for quick experiments
-# only use a subset of FineVision for quicker experiments
+# training dataset: "finevision" (local parquet subset) or "cauldron" (HuggingFaceM4/the_cauldron)
+train_dataset = "finevision"
+# only use a subset of the training data for quicker experiments (applies to both datasets)
 max_examples = 200000
+# Cauldron-specific hyperparameters
+cauldron_subset = "ai2d"
+cauldron_split = "train"
+cauldron_cache_root = "/data"
 # vision encoder hyperparameters
 vision_model_name = "ViT-B-32"
 vision_pretrained = "openai"
@@ -64,15 +71,21 @@ vision_num_tokens = 64
 # - "clip_global"  -> CLIPVisionPrefixEncoder (global image embedding)
 # - "clip_patch"   -> CLIPPatchVisionPrefixEncoder (CLIP ViT patch tokens)
 # - "patch"        -> PatchVisionPrefixEncoder (learned Conv2d patch embedding)
-vision_encoder_type = "clip_global"
+vision_encoder_type = "clip_patch"
 # patch-based encoder hyperparameters
 # - for "clip_patch": only `vision_pool` is used (spatial pooling over CLIP patches)
 # - for "patch": all three are used (image_size, patch_size, pool)
 vision_image_size = 224
 vision_patch_size = 16
 vision_pool = 2
-vision_lr = 1e-4
+vision_lr = 1e-2
 vision_weight_decay = 0.01
+# LLM optimizer hyperparameters (reuse GPT.setup_optimizers style)
+llm_unembedding_lr = 0.004
+llm_embedding_lr = 0.2
+llm_matrix_lr = 0.02
+llm_weight_decay = 0.0
+llm_init_lr_frac = 0.02
 # training loop
 num_iterations = 50000
 save_every = 50000
@@ -110,12 +123,55 @@ model.train()
 # -----------------------------------------------------------------------------
 # Dataset
 
-train_ds = FineVision(split="train", stop=max_examples)
-print0(f"FineVision train size (logical): {len(train_ds)} examples (subset)")
+if train_dataset == "finevision":
+    train_ds = FineVision(split="train", stop=max_examples)
+    print0(f"FineVision train size (logical): {len(train_ds)} examples (subset)")
+    # use the last parquet shard as a held-out test set
+    test_ds = FineVision(split="test")
+    print0(f"FineVision test size (logical): {len(test_ds)} examples (last shard)")
+elif train_dataset == "cauldron":
+    train_ds = Cauldron(
+        subset=cauldron_subset,
+        split=cauldron_split,
+        cache_root=cauldron_cache_root,
+        stop=max_examples,
+    )
+    print0(
+        f"The Cauldron subset='{cauldron_subset}' split='{cauldron_split}' "
+        f"train size (logical): {len(train_ds)} examples"
+    )
+else:
+    raise ValueError(f"Unsupported train_dataset: {train_dataset}")
+
+if train_dataset != "finevision":
+    test_ds = None
 
 
 # -----------------------------------------------------------------------------
 # DataLoader
+
+
+def collate_finevision_batch(batch, pad_token_id):
+    # batch: list of (ids, mask, images)
+    nrows = len(batch)
+    ncols = max(len(ids) for ids, mask, _ in batch) - 1
+    inputs = torch.full((nrows, ncols), pad_token_id, dtype=torch.long)
+    targets = torch.full((nrows, ncols), -1, dtype=torch.long)
+    images_batch = []
+
+    for i, (ids, mask, images) in enumerate(batch):
+        n = len(ids)
+        ids_tensor = torch.tensor(ids, dtype=torch.long)
+        inputs[i, : n - 1] = ids_tensor[:-1]
+        row_targets = ids_tensor[1:]
+        mask_tensor = torch.tensor(mask[1:], dtype=torch.long)
+        row_targets[mask_tensor == 0] = -1
+        targets[i, : n - 1] = row_targets
+        images_batch.append(images)
+
+    inputs = inputs.to(device)
+    targets = targets.to(device)
+    return inputs, targets, images_batch
 
 
 def finevision_data_generator(dataset, batch_size):
@@ -127,28 +183,6 @@ def finevision_data_generator(dataset, batch_size):
     """
 
     pad_token_id = tokenizer.encode_special("<|assistant_end|>")
-
-    def collate_and_yield(batch):
-        # batch: list of (ids, mask, images)
-        nrows = len(batch)
-        ncols = max(len(ids) for ids, mask, _ in batch) - 1
-        inputs = torch.full((nrows, ncols), pad_token_id, dtype=torch.long)
-        targets = torch.full((nrows, ncols), -1, dtype=torch.long)
-        images_batch = []
-
-        for i, (ids, mask, images) in enumerate(batch):
-            n = len(ids)
-            ids_tensor = torch.tensor(ids, dtype=torch.long)
-            inputs[i, : n - 1] = ids_tensor[:-1]
-            row_targets = ids_tensor[1:]
-            mask_tensor = torch.tensor(mask[1:], dtype=torch.long)
-            row_targets[mask_tensor == 0] = -1
-            targets[i, : n - 1] = row_targets
-            images_batch.append(images)
-
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-        return inputs, targets, images_batch
 
     batch = []
     while True:
@@ -167,7 +201,7 @@ def finevision_data_generator(dataset, batch_size):
             images = doc.get("images", None)
             batch.append((ids, mask, images))
             if len(batch) == batch_size:
-                yield collate_and_yield(batch)
+                yield collate_finevision_batch(batch, pad_token_id)
                 batch = []
 
 
@@ -229,22 +263,31 @@ user_config["vlm_tag_suffix"] = vlm_tag_suffix
 
 vision.train()
 
-# separate optimizers for LLM tail and vision encoder
-llm_lr = 1e-5
-llm_weight_decay = 0.0
-
-llm_params = [p for p in model.parameters() if p.requires_grad]
-llm_optimizer = torch.optim.AdamW(
-    llm_params,
-    lr=llm_lr,
+# separate optimizers for LLM and vision encoder
+llm_optimizers = model.setup_optimizers(
+    unembedding_lr=llm_unembedding_lr,
+    embedding_lr=llm_embedding_lr,
+    matrix_lr=llm_matrix_lr,
     weight_decay=llm_weight_decay,
 )
+for opt in llm_optimizers:
+    for group in opt.param_groups:
+        group["lr"] = group["lr"] * llm_init_lr_frac
+        group["initial_lr"] = group["lr"]
 
 vision_optimizer = torch.optim.AdamW(
     vision.parameters(),
     lr=vision_lr,
     weight_decay=vision_weight_decay,
 )
+for group in vision_optimizer.param_groups:
+    group["initial_lr"] = group["lr"]
+
+
+def get_lr_multiplier(step: int) -> float:
+    if num_iterations <= 0:
+        return 1.0
+    return 1.0 - float(step) / float(num_iterations)
 
 
 def build_image_batch(images_batch):
@@ -261,6 +304,61 @@ def build_image_batch(images_batch):
         t = vision.preprocess(img)  # preprocess -> (3, H, W)
         tensors.append(t)
     return torch.stack(tensors, dim=0).to(device)
+
+
+def evaluate_finevision_loss(model, vision, tokenizer, dataset, batch_size, device, autocast_ctx, max_examples=128):
+    if dataset is None:
+        return None
+
+    was_training_model = model.training
+    was_training_vision = vision.training
+    model.eval()
+    vision.eval()
+
+    pad_token_id = tokenizer.encode_special("<|assistant_end|>")
+    total_loss = 0.0
+    num_batches = 0
+
+    batch = []
+    with torch.no_grad(), autocast_ctx:
+        dataset_size = min(len(dataset), max_examples)
+        for i in range(dataset_size):
+            doc = dataset[i]
+            try:
+                ids, mask = tokenizer.render_conversation(doc)
+            except Exception as e:
+                if master_process:
+                    print0(f"Skipping FineVision test example {i} due to tokenization error: {e}")
+                continue
+            if len(ids) < 2:
+                continue
+            images = doc.get("images", None)
+            batch.append((ids, mask, images))
+            if len(batch) == batch_size:
+                inputs, targets, images_batch = collate_finevision_batch(batch, pad_token_id)
+                images_tensor = build_image_batch(images_batch)
+                visual_tokens = vision(images_tensor)
+                loss = model(inputs, targets, visual_embs=visual_tokens)
+                total_loss += loss.item()
+                num_batches += 1
+                batch = []
+
+        if batch:
+            inputs, targets, images_batch = collate_finevision_batch(batch, pad_token_id)
+            images_tensor = build_image_batch(images_batch)
+            visual_tokens = vision(images_tensor)
+            loss = model(inputs, targets, visual_embs=visual_tokens)
+            total_loss += loss.item()
+            num_batches += 1
+
+    if was_training_model:
+        model.train()
+    if was_training_vision:
+        vision.train()
+
+    if num_batches == 0:
+        return None
+    return total_loss / num_batches
 
 
 # -----------------------------------------------------------------------------
@@ -351,7 +449,13 @@ if resume_from_step >= 0:
         ckpt = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model_state"])
         vision.load_state_dict(ckpt["vision_state"])
-        llm_optimizer.load_state_dict(ckpt["optim_state"]["llm"])
+        llm_state = ckpt["optim_state"].get("llm")
+        if isinstance(llm_state, list):
+            for opt, state in zip(llm_optimizers, llm_state):
+                opt.load_state_dict(state)
+        elif llm_state is not None and len(llm_optimizers) > 0:
+            # backward compatibility: older checkpoints with a single LLM optimizer
+            llm_optimizers[0].load_state_dict(llm_state)
         vision_optimizer.load_state_dict(ckpt["optim_state"]["vision"])
         start_step = ckpt["step"] + 1
         print0(f"Resuming FineVision training from step {ckpt['step']}")
@@ -372,10 +476,23 @@ for step in range(start_step, num_iterations):
         visual_tokens = vision(images_tensor)
         loss = model(inputs, targets, visual_embs=visual_tokens)
 
-    llm_optimizer.zero_grad(set_to_none=True)
+    for opt in llm_optimizers:
+        opt.zero_grad(set_to_none=True)
     vision_optimizer.zero_grad(set_to_none=True)
+
     loss.backward()
-    llm_optimizer.step()
+
+    lrm = get_lr_multiplier(step)
+    for opt in llm_optimizers:
+        for group in opt.param_groups:
+            base_lr = group.get("initial_lr", group["lr"])
+            group["lr"] = base_lr * lrm
+    for group in vision_optimizer.param_groups:
+        base_lr = group.get("initial_lr", group["lr"])
+        group["lr"] = base_lr * lrm
+
+    for opt in llm_optimizers:
+        opt.step()
     vision_optimizer.step()
 
     loss_item = loss.item()
@@ -387,17 +504,21 @@ for step in range(start_step, num_iterations):
         }
     )
 
-    # periodic visual benchmark evaluation (MMStar + MME)
+    # periodic visual benchmark evaluation (FineVision test loss + MMStar + MME)
     if master_process and (last_step or (vis_eval_every > 0 and step > 0 and step % vis_eval_every == 0)):
+        finevision_test_loss = evaluate_finevision_loss(
+            model, vision, tokenizer, test_ds, device_batch_size, device, autocast_ctx
+        )
         mmstar_acc = evaluate_mmstar(model, vision, tokenizer, device, autocast_ctx, mmstar_eval_examples)
         mme_acc = evaluate_mme(model, vision, tokenizer, device, autocast_ctx, mme_eval_examples)
-        wandb_run.log(
-            {
-                "step": step,
-                "mmstar/acc": mmstar_acc,
-                "mme/acc": mme_acc,
-            }
-        )
+        log_payload = {
+            "step": step,
+            "mmstar/acc": mmstar_acc,
+            "mme/acc": mme_acc,
+        }
+        if finevision_test_loss is not None:
+            log_payload["finevision/test_loss"] = finevision_test_loss
+        wandb_run.log(log_payload)
 
     if last_step or (save_every > 0 and step > 0 and step % save_every == 0):
         ckpt = {
@@ -407,7 +528,7 @@ for step in range(start_step, num_iterations):
             "model_config": meta["model_config"],
             "user_config": user_config,
             "optim_state": {
-                "llm": llm_optimizer.state_dict(),
+                "llm": [opt.state_dict() for opt in llm_optimizers],
                 "vision": vision_optimizer.state_dict(),
             },
         }

@@ -83,7 +83,7 @@ def build_visual_tokens(vision, image_path, device):
     return visual_tokens
 
 
-def generate_answer(model, tokenizer, question, visual_tokens, device, max_tokens=128, temperature=0.6, top_k=50):
+def generate_answer(model, tokenizer, question, visual_tokens, device, max_tokens=128, temperature=0.1, top_k=50):
     bos = tokenizer.get_bos_token_id()
     user_start = tokenizer.encode_special("<|user_start|>")
     user_end = tokenizer.encode_special("<|user_end|>")

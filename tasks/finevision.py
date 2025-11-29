@@ -18,9 +18,10 @@ from tasks.common import Task
 class FineVision(Task):
     """FineVisionMax local subset (backed by local parquet shards)."""
 
-    def __init__(self, split="train", **kwargs):
+    def __init__(self, split: str = "train", **kwargs):
         super().__init__(**kwargs)
-        assert split == "train", "FineVision currently only supports split='train'"
+        assert split in ("train", "test"), "FineVision supports split='train' or 'test'"
+
         base_dir = get_base_dir()
         parquet_dir = os.path.join(base_dir, "finevision_parquet")
         if not os.path.isdir(parquet_dir):
@@ -35,7 +36,18 @@ class FineVision(Task):
                 f"No parquet files found in {parquet_dir}. "
                 "Run `python -m scripts.prepare_finevision_subset` first."
             )
-        self.ds = load_dataset("parquet", data_files={"train": files}, split="train")
+
+        if len(files) == 1:
+            # Degenerate case: only one shard available, use it for both splits.
+            selected_files = files
+        elif split == "train":
+            # Use all but the last shard for training.
+            selected_files = files[:-1]
+        else:
+            # Use only the last shard for testing.
+            selected_files = files[-1:]
+
+        self.ds = load_dataset("parquet", data_files={"train": selected_files}, split="train")
         self.length = len(self.ds)
 
     def num_examples(self):
