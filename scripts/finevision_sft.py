@@ -29,10 +29,12 @@ from nanochat.checkpoint_manager import load_model, save_checkpoint, load_checkp
 from nanochat.vision import (
     CLIPVisionPrefixEncoder,
     CLIPPatchVisionPrefixEncoder,
+    SigCLIPPatchVisionPrefixEncoder,
     PatchVisionPrefixEncoder,
 )
 from tasks.finevision import FineVision
 from tasks.cauldron import Cauldron
+from tasks.small_cauldron import SmallCauldron
 from tasks.mmstar import MMStar
 from tasks.mme import MME
 from scripts.mmstar_eval import (
@@ -71,29 +73,32 @@ vision_num_tokens = 64
 # - "clip_global"  -> CLIPVisionPrefixEncoder (global image embedding)
 # - "clip_patch"   -> CLIPPatchVisionPrefixEncoder (CLIP ViT patch tokens)
 # - "patch"        -> PatchVisionPrefixEncoder (learned Conv2d patch embedding)
+# - "sigclip_patch"-> SigCLIPPatchVisionPrefixEncoder (SigCLIP ViT patch tokens with pixel unshuffle)
 vision_encoder_type = "clip_patch"
 # patch-based encoder hyperparameters
 # - for "clip_patch": only `vision_pool` is used (spatial pooling over CLIP patches)
 # - for "patch": all three are used (image_size, patch_size, pool)
+# - for "sigclip_patch": `vision_shuffle_factor` controls pixel-unshuffle spatial reduction
 vision_image_size = 224
 vision_patch_size = 16
 vision_pool = 2
-vision_lr = 1e-2
+vision_shuffle_factor = 2
+vision_lr = 5e-3
 vision_weight_decay = 0.01
 # LLM optimizer hyperparameters (reuse GPT.setup_optimizers style)
 llm_unembedding_lr = 0.004
-llm_embedding_lr = 0.2
+llm_embedding_lr = 0.1 #0.2
 llm_matrix_lr = 0.02
 llm_weight_decay = 0.0
-llm_init_lr_frac = 0.02
+llm_init_lr_frac = 0.05
 # training loop
 num_iterations = 50000
-save_every = 50000
+save_every = 10000
 resume_from_step = -1
 # vision eval
-vis_eval_every = 500
-mmstar_eval_examples = 200
-mme_eval_examples = 200
+vis_eval_every = 250
+mmstar_eval_examples = 100
+mme_eval_examples = 100
 #
 # checkpoint naming: final directory is f"{model_tag}_{vlm_tag_suffix}"
 vlm_tag_suffix = "finevision"
@@ -140,6 +145,13 @@ elif train_dataset == "cauldron":
         f"The Cauldron subset='{cauldron_subset}' split='{cauldron_split}' "
         f"train size (logical): {len(train_ds)} examples"
     )
+elif train_dataset == "small_cauldron":
+    train_ds = SmallCauldron(
+        split=cauldron_split,
+        cache_root=cauldron_cache_root,
+        stop=max_examples,
+    )
+    print0(f"small-cauldron train size (logical): {len(train_ds)} examples")
 else:
     raise ValueError(f"Unsupported train_dataset: {train_dataset}")
 
@@ -231,6 +243,18 @@ elif vision_encoder_type == "clip_patch":
     user_config["vision_model_name"] = vision_model_name
     user_config["vision_pretrained"] = vision_pretrained
     user_config["vision_pool"] = vision_pool
+elif vision_encoder_type == "sigclip_patch":
+    vision = SigCLIPPatchVisionPrefixEncoder(
+        d_model=model.config.n_embd,
+        model_name=vision_model_name,
+        pretrained=vision_pretrained,
+        shuffle_factor=vision_shuffle_factor,
+        device=device,
+    ).to(device)
+    vision_num_tokens = getattr(vision, "num_tokens", vision_num_tokens)
+    user_config["vision_model_name"] = vision_model_name
+    user_config["vision_pretrained"] = vision_pretrained
+    user_config["vision_shuffle_factor"] = vision_shuffle_factor
 elif vision_encoder_type == "patch":
     vision = PatchVisionPrefixEncoder(
         d_model=model.config.n_embd,
@@ -257,6 +281,9 @@ if vlm_tag_suffix == "finevision":
     elif vision_encoder_type == "clip_patch":
         safe_name = str(vision_model_name).replace("/", "-")
         vlm_tag_suffix = f"finevision_clippatch_{safe_name}_pool{vision_pool}"
+    elif vision_encoder_type == "sigclip_patch":
+        safe_name = str(vision_model_name).replace("/", "-")
+        vlm_tag_suffix = f"finevision_sigclippatch_{safe_name}_shuf{vision_shuffle_factor}"
     elif vision_encoder_type == "patch":
         vlm_tag_suffix = f"finevision_patch_i{vision_image_size}_p{vision_patch_size}_pool{vision_pool}"
 user_config["vlm_tag_suffix"] = vlm_tag_suffix

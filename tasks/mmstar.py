@@ -23,12 +23,13 @@ class MMStar(Task):
     Minimal MMStar benchmark wrapper over Lin-Chen/MMStar (val split).
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, judge_fn=None, **kwargs):
         super().__init__(**kwargs)
         # small dataset (~1.5K rows), ok to load fully in memory
         self.ds = load_dataset("Lin-Chen/MMStar", split="val")
         self.length = len(self.ds)
         assert self.length > 0, "Lin-Chen/MMStar(val) is empty?"
+        self.judge_fn = judge_fn
 
     @property
     def eval_type(self):
@@ -45,7 +46,8 @@ class MMStar(Task):
         q = row["question"]
         answer = row["answer"]  # letter like "A"
 
-        prompt = q.strip() + "\n\nPlease answer with the option letter (A, B, C, or D) only."
+        # Use the original question text directly without extra answering instructions.
+        prompt = q.strip()
 
         conversation = {
             "messages": [
@@ -73,7 +75,7 @@ class MMStar(Task):
         gt_norm = gt.lower()
         comp_norm = completion.lower()
 
-        # if ground truth is a single letter, check both letter and option content
+        # if ground truth is a single letter, check if the letter appears in completion
         if len(gt_norm) == 1 and gt_norm.isalpha():
             # First, check if the letter appears in completion
             first_char = None
@@ -83,33 +85,53 @@ class MMStar(Task):
                     break
             if first_char == gt_norm:
                 return True
-            
-            # If letter doesn't match, check if any word from the option content appears
+            # Otherwise, try to match on the option content text (more lenient)
             question = problem.get("mmstar_question", "")
             if question:
-                # Extract option content for the correct answer letter
-                # Pattern: "A: content" or "A. content" or "A) content"
                 question_lower = question.lower()
-                gt_letter_lower = gt_norm.lower()
-                
-                # Match pattern like "A: content" until next option or end
-                pattern = rf"\b{gt_letter_lower}[:\s\.\)]\s*(.+?)(?=\s*(?:[A-D][:\s\.\)]|$))"
+                pattern = rf"\b{gt_norm}[:\s\.\)]\s*(.+?)(?=\s*(?:[a-dA-D][:\s\.\)]|$))"
                 match = re.search(pattern, question_lower, re.IGNORECASE | re.DOTALL)
-                
                 if match:
                     option_content = match.group(1).strip()
                     if option_content:
                         option_content_clean = option_content.translate(str.maketrans('', '', string.punctuation))
-                        option_words = [w.lower() for w in option_content_clean.split() if len(w) >= 1]
-                        
-                        # Check if any word from the option appears in completion
+                        if option_content_clean.lower() in comp_norm:
+                            return True
+                        option_words = [w.lower() for w in option_content_clean.split() if w]
                         for word in option_words:
-                            if word in comp_norm:
+                            if word and word in comp_norm:
                                 return True
-            
+            if self.judge_fn:
+                return bool(self.judge_fn(problem, completion))
             return False
+            # # If letter doesn't match, check if any word from the option content appears
+            # question = problem.get("mmstar_question", "")
+            # if question:
+            #     # Extract option content for the correct answer letter
+            #     # Pattern: "A: content" or "A. content" or "A) content"
+            #     question_lower = question.lower()
+            #     gt_letter_lower = gt_norm.lower()
+            #     
+            #     # Match pattern like "A: content" until next option or end
+            #     pattern = rf"\b{gt_letter_lower}[:\s\.\)]\s*(.+?)(?=\s*(?:[A-D][:\s\.\)]|$))"
+            #     match = re.search(pattern, question_lower, re.IGNORECASE | re.DOTALL)
+            #     
+            #     if match:
+            #         option_content = match.group(1).strip()
+            #         if option_content:
+            #             option_content_clean = option_content.translate(str.maketrans('', '', string.punctuation))
+            #             option_words = [w.lower() for w in option_content_clean.split() if len(w) >= 1]
+            #             
+            #             # Check if any word from the option appears in completion
+            #             for word in option_words:
+            #                 if word in comp_norm:
+            #                     return True
+            # 
+            # return False
 
         # otherwise, check if gt text appears in completion
-        return gt_norm in comp_norm
-
-
+        if gt_norm in comp_norm:
+            return True
+        if self.judge_fn:
+            return bool(self.judge_fn(problem, completion))
+        return False

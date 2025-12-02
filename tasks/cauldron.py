@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from typing import Any, List
 
-from datasets import load_dataset
+from datasets import get_dataset_config_names, load_dataset
 
 from tasks.common import Task
 
@@ -27,8 +27,8 @@ class Cauldron(Task):
     Wrapper around HuggingFaceM4/the_cauldron.
 
     By default we load the "ai2d" subset and the "train" split.
-    The full dataset is ~170 GB; we allow downloading all data to /data,
-    but callers can override `subset` if they want other configs.
+    Use subset="all" to iterate over every available config sequentially
+    (without concatenating into memory).
     """
 
     def __init__(
@@ -49,20 +49,48 @@ class Cauldron(Task):
         self.subset = subset
         self.split = split
 
-        self.ds = load_dataset(
-            "HuggingFaceM4/the_cauldron",
-            subset,
-            split=split,
-            cache_dir=cache_dir,
-        )
-        self.length = len(self.ds)
-        assert self.length > 0, f"The Cauldron subset '{subset}' ({split}) is empty?"
+        if subset in ("all", "*"):
+            subset_names = get_dataset_config_names("HuggingFaceM4/the_cauldron")
+        else:
+            subset_names = [subset]
+        subset_names = sorted(subset_names)
+
+        self.datasets: List[tuple[str, Any]] = []
+        total_len = 0
+        for name in subset_names:
+            ds = load_dataset(
+                "HuggingFaceM4/the_cauldron",
+                name,
+                split=split,
+                cache_dir=cache_dir,
+            )
+            if len(ds) == 0:
+                continue
+            self.datasets.append((name, ds))
+            total_len += len(ds)
+
+        self.length = total_len
+        assert self.length > 0, f"The Cauldron subset(s) {subset_names} ({split}) are empty?"
+
+        # Keep backward compatibility: expose single dataset as self.ds
+        self.ds = self.datasets[0][1] if len(self.datasets) == 1 else None
+        self.subset_names = [name for name, _ in self.datasets]
 
     def num_examples(self) -> int:
         return self.length
 
     def get_example(self, index: int) -> dict[str, Any]:
-        row = self.ds[index]
+        assert 0 <= index < self.length, f"Index {index} out of range for Cauldron with {self.length} rows"
+
+        # Map global index into the correct subset without materializing all rows.
+        row = None
+        for _, ds in self.datasets:
+            if index < len(ds):
+                row = ds[index]
+                break
+            index -= len(ds)
+        assert row is not None, "Failed to locate row in Cauldron datasets"
+
         images = row.get("images") or []
         texts = row.get("texts") or []
 
@@ -90,4 +118,3 @@ class Cauldron(Task):
         if sources:
             conversation["cauldron_sources"] = sources
         return conversation
-

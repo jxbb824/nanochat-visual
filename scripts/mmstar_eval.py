@@ -12,11 +12,15 @@ import os
 
 import torch
 from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
+
+import requests
 
 from nanochat.common import autodetect_device_type, compute_init, compute_cleanup
 from nanochat.tokenizer import get_tokenizer
 from tasks.mmstar import MMStar
 from scripts.finevision_cli import load_vlm_checkpoint
+from typing import Callable
 
 
 def build_visual_tokens(vision, image, device):
@@ -66,12 +70,71 @@ def generate_answer(model, tokenizer, question, visual_tokens, device, max_token
     return answer
 
 
+def build_openrouter_judge(api_key: str, model: str, timeout: float) -> Callable:
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    def judge(problem, completion: str) -> bool:
+        question = problem.get("mmstar_question", "")
+        answer_letter = str(problem.get("mmstar_answer", "")).strip()
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You grade multiple-choice answers leniently. "
+                        "Return 1 if the candidate clearly points to the correct option, even if it doesn't output the letter explicitly. "
+                        "Look for the described option content or its gist. Output only 1 or 0."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question with options:\n{question}\n\n"
+                        f"Ground-truth letter: {answer_letter}\n"
+                        f"Candidate answer: {completion}\n"
+                        "Reply with 1 if the candidate corresponds to the correct option (letter match OR descriptive match), otherwise 0."
+                    ),
+                },
+            ],
+            "temperature": 0.0,
+        }
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            txt = resp.json()["choices"][0]["message"]["content"]
+            first = (txt or "").strip()[:1]
+            return first == "1"
+        except requests.HTTPError as e:
+            body = ""
+            try:
+                body = resp.text
+            except Exception:
+                body = ""
+            print(f"[judge] OpenRouter HTTP {resp.status_code}: {body}")
+            return False
+        except Exception as e:
+            print(f"[judge] OpenRouter request failed: {e}")
+            return False
+
+    return judge
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate VLM on MMStar-style benchmark")
     parser.add_argument("--vlm-tag", type=str, default="d20_finevision", help="VLM checkpoint tag under vlm_checkpoints/")
     parser.add_argument("--max-examples", type=int, default=-1, help="Max number of examples to evaluate (-1 = all)")
     parser.add_argument("--device-type", type=str, default="", choices=["cuda", "cpu", "mps"], help="Device type")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
+    parser.add_argument("--judge-openrouter", action="store_true", help="Use OpenRouter LLM judge when letter check fails")
+    parser.add_argument("--judge-model", type=str, default="openai/gpt-5-nano", help="OpenRouter model name")
+    parser.add_argument("--judge-api-key-env", type=str, default="OPENROUTER_API_KEY", help="Env var for OpenRouter API key")
+    parser.add_argument("--judge-timeout", type=float, default=15.0, help="OpenRouter request timeout (seconds)")
+    parser.add_argument("--judge-workers", type=int, default=8, help="Max threads for judge requests")
     args = parser.parse_args()
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
@@ -87,14 +150,19 @@ def main():
     tokenizer = get_tokenizer()
     model, vision = load_vlm_checkpoint(device, vlm_tag=args.vlm_tag)
 
-    ds = MMStar()
+    judge_fn = None
+    if args.judge_openrouter:
+        api_key = os.environ.get(args.judge_api_key_env, "")
+        if not api_key:
+            raise RuntimeError(f"Set {args.judge_api_key_env} for OpenRouter judging")
+        judge_fn = build_openrouter_judge(api_key, args.judge_model, args.judge_timeout)
+
+    ds = MMStar(judge_fn=judge_fn)
     n = len(ds)
     if args.max_examples > 0:
         n = min(n, args.max_examples)
 
-    num_correct = 0
-    total = 0
-
+    preds = []
     with torch.no_grad(), autocast_ctx:
         for idx in range(n):
             conversation = ds[idx]
@@ -112,15 +180,25 @@ def main():
                 temperature=0.0,
                 top_k=None,
             )
+            preds.append((conversation, pred))
 
-            ok = ds.evaluate(conversation, pred)
-            num_correct += int(ok)
-            total += 1
+            if len(preds) % 50 == 0 or len(preds) == n:
+                acc = 100.0 * len(preds) / n
+                print(f"[gen {len(preds)}/{n}]")
 
-            if total % 50 == 0 or total == n:
-                acc = 100.0 * num_correct / total
-                print(f"[{total}/{n}] current accuracy: {acc:.2f}%")
+    def eval_one(cp):
+        conv, pred = cp
+        return ds.evaluate(conv, pred)
 
+    results = []
+    if judge_fn and args.judge_workers > 1:
+        with ThreadPoolExecutor(max_workers=args.judge_workers) as ex:
+            results = list(ex.map(eval_one, preds))
+    else:
+        results = [eval_one(cp) for cp in preds]
+
+    num_correct = sum(int(ok) for ok in results)
+    total = len(results)
     if total > 0:
         acc = 100.0 * num_correct / total
         print(f"MMStar-style accuracy: {num_correct}/{total} = {acc:.2f}%")
@@ -132,5 +210,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
