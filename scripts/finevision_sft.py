@@ -37,6 +37,7 @@ from tasks.cauldron import Cauldron
 from tasks.small_cauldron import SmallCauldron
 from tasks.mmstar import MMStar
 from tasks.mme import MME
+from tasks.vqav2 import VQAv2Small
 from scripts.mmstar_eval import (
     build_visual_tokens as mmstar_build_visual_tokens,
     generate_answer as mmstar_generate_answer,
@@ -44,6 +45,10 @@ from scripts.mmstar_eval import (
 from scripts.mme_eval import (
     build_visual_tokens as mme_build_visual_tokens,
     generate_answer as mme_generate_answer,
+)
+from scripts.vqav2_eval import (
+    build_visual_tokens as vqav2_build_visual_tokens,
+    generate_answer as vqav2_generate_answer,
 )
 
 
@@ -60,7 +65,9 @@ device_batch_size = 4  # small default for quick experiments
 # training dataset: "finevision" (local parquet subset) or "cauldron" (HuggingFaceM4/the_cauldron)
 train_dataset = "finevision"
 # only use a subset of the training data for quicker experiments (applies to both datasets)
-max_examples = 200000
+max_examples = 900000
+# shuffle training data each epoch to reduce distribution drift
+shuffle_data = True
 # Cauldron-specific hyperparameters
 cauldron_subset = "ai2d"
 cauldron_split = "train"
@@ -83,22 +90,23 @@ vision_image_size = 224
 vision_patch_size = 16
 vision_pool = 2
 vision_shuffle_factor = 2
-vision_lr = 5e-3
+vision_lr = 3e-3
 vision_weight_decay = 0.01
 # LLM optimizer hyperparameters (reuse GPT.setup_optimizers style)
 llm_unembedding_lr = 0.004
-llm_embedding_lr = 0.1 #0.2
+llm_embedding_lr = 0.2 #0.2
 llm_matrix_lr = 0.02
 llm_weight_decay = 0.0
-llm_init_lr_frac = 0.05
+llm_init_lr_frac = 0.02
 # training loop
 num_iterations = 50000
-save_every = 10000
+save_every = 20000
 resume_from_step = -1
 # vision eval
-vis_eval_every = 250
+vis_eval_every = 500
 mmstar_eval_examples = 100
 mme_eval_examples = 100
+vqav2_eval_examples = 100
 #
 # checkpoint naming: final directory is f"{model_tag}_{vlm_tag_suffix}"
 vlm_tag_suffix = "finevision"
@@ -186,7 +194,7 @@ def collate_finevision_batch(batch, pad_token_id):
     return inputs, targets, images_batch
 
 
-def finevision_data_generator(dataset, batch_size):
+def finevision_data_generator(dataset, batch_size, shuffle=True):
     """
     Yields (inputs, targets, images_batch).
     - inputs, targets: 2D tensors, shape (batch, seq_len)
@@ -197,8 +205,16 @@ def finevision_data_generator(dataset, batch_size):
     pad_token_id = tokenizer.encode_special("<|assistant_end|>")
 
     batch = []
+    rng = torch.Generator()
+    rng.manual_seed(42)
     while True:
-        for i in range(ddp_rank, len(dataset), ddp_world_size):
+        if shuffle:
+            indices = torch.randperm(len(dataset), generator=rng)
+        else:
+            indices = torch.arange(len(dataset))
+        for i in indices.tolist():
+            if i % ddp_world_size != ddp_rank:
+                continue
             doc = dataset[i]
             try:
                 ids, mask = tokenizer.render_conversation(doc)
@@ -217,7 +233,7 @@ def finevision_data_generator(dataset, batch_size):
                 batch = []
 
 
-train_loader = finevision_data_generator(train_ds, batch_size=device_batch_size)
+train_loader = finevision_data_generator(train_ds, batch_size=device_batch_size, shuffle=shuffle_data)
 
 
 # -----------------------------------------------------------------------------
@@ -411,7 +427,7 @@ def evaluate_mmstar(model, vision, tokenizer, device, autocast_ctx, max_examples
                 question,
                 visual_tokens,
                 device,
-                max_tokens=32,
+                max_tokens=64,
                 temperature=0.0,
                 top_k=None,
             )
@@ -447,6 +463,41 @@ def evaluate_mme(model, vision, tokenizer, device, autocast_ctx, max_examples):
                 visual_tokens,
                 device,
                 max_tokens=8,
+                temperature=0.0,
+                top_k=None,
+            )
+            ok = ds.evaluate(conversation, pred)
+            num_correct += int(ok)
+            total += 1
+    acc = float(num_correct) / total if total > 0 else 0.0
+    if was_training_model:
+        model.train()
+    if was_training_vision:
+        vision.train()
+    return acc
+
+
+def evaluate_vqav2(model, vision, tokenizer, device, autocast_ctx, max_examples):
+    ds = VQAv2Small(split="validation")
+    n = len(ds) if max_examples <= 0 else min(len(ds), max_examples)
+    was_training_model = model.training
+    was_training_vision = vision.training
+    model.eval()
+    vision.eval()
+    num_correct, total = 0, 0
+    with torch.no_grad(), autocast_ctx:
+        for idx in range(n):
+            conversation = ds[idx]
+            image = conversation["vqav2_image"]
+            question = conversation["messages"][0]["content"]
+            visual_tokens = vqav2_build_visual_tokens(vision, image, device)
+            pred = vqav2_generate_answer(
+                model,
+                tokenizer,
+                question,
+                visual_tokens,
+                device,
+                max_tokens=64,
                 temperature=0.0,
                 top_k=None,
             )
@@ -538,10 +589,12 @@ for step in range(start_step, num_iterations):
         )
         mmstar_acc = evaluate_mmstar(model, vision, tokenizer, device, autocast_ctx, mmstar_eval_examples)
         mme_acc = evaluate_mme(model, vision, tokenizer, device, autocast_ctx, mme_eval_examples)
+        vqav2_acc = evaluate_vqav2(model, vision, tokenizer, device, autocast_ctx, vqav2_eval_examples)
         log_payload = {
             "step": step,
             "mmstar/acc": mmstar_acc,
             "mme/acc": mme_acc,
+            "vqav2/acc": vqav2_acc,
         }
         if finevision_test_loss is not None:
             log_payload["finevision/test_loss"] = finevision_test_loss

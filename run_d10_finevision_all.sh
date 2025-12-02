@@ -31,17 +31,18 @@ else
 fi
 
 NPROC_PER_NODE=${NPROC_PER_NODE:-2}
-ITERATIONS=${NUM_ITERATIONS:-20000}
+ITERATIONS=${NUM_ITERATIONS:-10000}
 BATCH=${DEVICE_BATCH_SIZE:-16}
 
 configs=(
-  "d10_finevision_clip|finevision_clip|clip_global|ViT-B-32|openai|"
-  "d10_finevision_clippatch|finevision_clippatch_ViT-B-32_pool1|clip_patch|ViT-B-32|openai|--vision_pool=1"
-  "d10_finevision_siglippatch_shuf2|finevision_sigclippatch_ViT-B-16-SigLIP_shuf2|sigclip_patch|ViT-B-16-SigLIP|webli|--vision_shuffle_factor=2"
+  # "d10_finevision_clip|finevision_clip|clip_global|ViT-B-32|openai|"
+  # "d10_finevision_clippatch|finevision_clippatch_ViT-B-32_pool1|clip_patch|ViT-B-32|openai|--vision_pool=1"
+  # "d10_finevision_siglippatch_shuf2|finevision_sigclippatch_ViT-B-16-SigLIP_shuf2|sigclip_patch|ViT-B-16-SigLIP|webli|--vision_shuffle_factor=2"
   "d10_finevision_siglippatch_shuf1|finevision_sigclippatch_ViT-B-16-SigLIP_shuf1|sigclip_patch|ViT-B-16-SigLIP|webli|--vision_shuffle_factor=1"
 )
 
-for cfg in "${configs[@]}"; do
+for idx in "${!configs[@]}"; do
+  cfg="${configs[$idx]}"
   IFS='|' read -r RUN_NAME VLM_SUFFIX ENC MODEL PRETRAIN EXTRA <<< "$cfg"
   export WANDB_RUN="$RUN_NAME"
   torchrun --standalone --nproc_per_node=$NPROC_PER_NODE \
@@ -57,7 +58,8 @@ for cfg in "${configs[@]}"; do
     --num_iterations=$ITERATIONS \
     $EXTRA
 
-  VLM_TAG="d10_${VLM_SUFFIX}"
-  # python -m scripts.mmstar_eval --vlm-tag="$VLM_TAG" --device-type=cuda
-  # python -m scripts.mme_eval --vlm-tag="$VLM_TAG" --device-type=cuda
+  if [ "$idx" -lt $((${#configs[@]} - 1)) ]; then
+    echo "Sleeping 10s before next run..."
+    sleep 10
+  fi
 done

@@ -1,12 +1,11 @@
 #!/bin/bash
 
-# Train a d10-based vision-language model on FineVision and then evaluate
-# it on MMStar and MME (small subsets).
+# Train a d10-based vision-language model on the small-cauldron dataset.
 #
 # Usage (with wandb):
-#   WANDB_RUN=d10_finevision \
+#   WANDB_RUN=d10_small_cauldron \
 #   NANOCHAT_BASE_DIR="$HOME/.cache/nanochat" \
-#     screen -L -Logfile d10_finevision.log -S d10_finevision bash run_d10_finevision.sh
+#     screen -L -Logfile d10_small_cauldron.log -S d10_small_cauldron bash run_d10_small_cauldron.sh
 
 set -e
 
@@ -26,11 +25,12 @@ source .venv/bin/activate
 # wandb setup
 
 if [ -z "$WANDB_RUN" ]; then
-    WANDB_RUN=d10_finevision
+    WANDB_RUN=d10_small_cauldron
 fi
 
-# CLIP patch encoder setup (ViT-B-32, pool=1)
-VLM_TAG_SUFFIX=finevision_clippatch_ViT-B-32_pool1_fixed_4
+# Descriptive VLM tag for the CLIP-based patch encoder on small-cauldron
+# Note: ViT-B-32 has 7x7=49 patches, so pool must be 1 or 7.
+VLM_TAG_SUFFIX=smallcauldron_clippatch_ViT-B-32_pool1
 VLM_TAG="d10_${VLM_TAG_SUFFIX}"
 
 # -----------------------------------------------------------------------------
@@ -47,18 +47,7 @@ fi
 export NANOCHAT_TOKENIZER_DIR="$NANOCHAT_BASE_DIR/tokenizer/d10"
 
 # -----------------------------------------------------------------------------
-# Prepare FineVision local parquet subset (only once)
-
-FINEVISION_PARQUET_DIR="$NANOCHAT_BASE_DIR/finevision_parquet"
-if [ ! -d "$FINEVISION_PARQUET_DIR" ] || [ -z "$(ls -1 "$FINEVISION_PARQUET_DIR"/*.parquet 2>/dev/null)" ]; then
-    echo "FineVision parquet subset not found at $FINEVISION_PARQUET_DIR, preparing a new subset..."
-    python -m scripts.prepare_finevision_subset --num_shards=100
-else
-    echo "Found existing FineVision parquet subset at $FINEVISION_PARQUET_DIR, reusing it."
-fi
-
-# -----------------------------------------------------------------------------
-# Run FineVision finetuning with d10 base as backbone
+# Run small-cauldron finetuning with d10 base as backbone
 
 NPROC_PER_NODE=2
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE \
@@ -67,10 +56,12 @@ torchrun --standalone --nproc_per_node=$NPROC_PER_NODE \
   --source=base \
   --model_tag=d10 \
   --vlm_tag_suffix="$VLM_TAG_SUFFIX" \
+  --train_dataset=small_cauldron \
+  --cauldron_cache_root="$NANOCHAT_BASE_DIR" \
   --vision_encoder_type=clip_patch \
   --vision_pool=1 \
   --device_batch_size=16 \
-  --num_iterations=20000
+  --num_iterations=10000
 
 # -----------------------------------------------------------------------------
 

@@ -87,6 +87,12 @@ class CLIPVisionPrefixEncoder(nn.Module):
         x = x.view(B, self.num_tokens, -1)
         return x
 
+    def train(self, mode: bool = True):
+        # Keep the frozen CLIP backbone in eval mode to avoid dropout/drop-path noise.
+        super().train(mode)
+        self.clip_model.eval()
+        return self
+
 
 class CLIPPatchVisionPrefixEncoder(nn.Module):
     """
@@ -237,6 +243,175 @@ class CLIPPatchVisionPrefixEncoder(nn.Module):
         x = self.proj(x)  # (B, num_tokens, d_model)
         return x
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.clip_model.eval()
+        return self
+
+
+class SigCLIPPatchVisionPrefixEncoder(nn.Module):
+    """
+    SigCLIP patch encoder with pixel-unshuffle spatial reduction (4x fewer tokens).
+    The SigLIP backbone stays frozen; only the projection to GPT space is trained.
+    """
+
+    def __init__(
+        self,
+        d_model,
+        model_name: str = "ViT-SO400M-14-SigLIP",
+        pretrained: str = "webli",
+        shuffle_factor: int = 2,
+        device=None,
+    ):
+        super().__init__()
+        try:
+            import open_clip
+        except ImportError as e:
+            raise ImportError(
+                "open_clip_torch is required for SigCLIPPatchVisionPrefixEncoder. "
+                "Install it with `pip install open_clip_torch`."
+            ) from e
+
+        self.shuffle_factor = int(shuffle_factor)
+        assert self.shuffle_factor >= 1, "shuffle_factor must be >= 1"
+
+        self.clip_model, _, self.preprocess = open_clip.create_model_and_transforms(
+            model_name, pretrained=pretrained, device=device
+        )
+        self.clip_model.eval()
+        for p in self.clip_model.parameters():
+            p.requires_grad = False
+
+        visual = self.clip_model.visual
+        self._is_timm_vit = hasattr(visual, "trunk") and hasattr(visual.trunk, "patch_embed")
+
+        if self._is_timm_vit:
+            grid_h, grid_w = visual.trunk.patch_embed.grid_size
+            visual_dim = visual.trunk.embed_dim
+        else:
+            if not hasattr(visual, "conv1") or not hasattr(visual, "transformer"):
+                raise ValueError("SigCLIPPatchVisionPrefixEncoder only supports ViT-style SigCLIP backbones.")
+
+            grid_size = getattr(visual, "grid_size", None)
+            if grid_size is None:
+                image_size = getattr(visual, "image_size", 224)
+                patch_size = getattr(visual, "patch_size", 16)
+                if isinstance(image_size, (tuple, list)):
+                    image_size = image_size[0]
+                if isinstance(patch_size, (tuple, list)):
+                    patch_size = patch_size[0]
+                grid_h = image_size // patch_size
+                grid_w = image_size // patch_size
+            else:
+                if isinstance(grid_size, (tuple, list)):
+                    grid_h, grid_w = grid_size
+                else:
+                    grid_h = grid_w = int(grid_size)
+            visual_dim = getattr(visual, "width", None)
+            if visual_dim is None:
+                visual_dim = visual.conv1.out_channels
+
+        assert grid_h > 0 and grid_w > 0
+        assert grid_h % self.shuffle_factor == 0 and grid_w % self.shuffle_factor == 0, (
+            "patch grid must be divisible by shuffle_factor"
+        )
+
+        self.grid_h = grid_h
+        self.grid_w = grid_w
+        reduced_h = grid_h // self.shuffle_factor
+        reduced_w = grid_w // self.shuffle_factor
+        self.num_tokens = reduced_h * reduced_w
+
+        proj_in_dim = visual_dim * (self.shuffle_factor ** 2)
+        self.proj = nn.Linear(proj_in_dim, d_model)
+
+    def _encode_patches(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        Run the frozen SigCLIP vision transformer and return patch tokens before
+        the final pooling/projection.
+        """
+        visual = self.clip_model.visual
+
+        if self._is_timm_vit:
+            feats = visual.trunk.forward_features(images)
+            if isinstance(feats, dict):
+                if "x" in feats:
+                    tokens = feats["x"]
+                elif "tokens" in feats:
+                    tokens = feats["tokens"]
+                else:
+                    raise ValueError("Unexpected forward_features output for SigLIP timm backbone")
+            else:
+                tokens = feats
+            # tokens should be (B, N, C) patch tokens without CLS.
+            patch_tokens = tokens
+        else:
+            x = visual.conv1(images)  # (B, C, H', W')
+            x = x.reshape(x.shape[0], x.shape[1], -1)  # (B, C, H'*W')
+            x = x.permute(0, 2, 1)  # (B, H'*W', C)
+
+            class_embedding = visual.class_embedding.to(x.dtype)
+            class_token = class_embedding.unsqueeze(0).expand(x.shape[0], -1, -1)
+            x = torch.cat([class_token, x], dim=1)  # (B, 1 + H'*W', C)
+
+            pos_embed = visual.positional_embedding.to(dtype=x.dtype, device=x.device)
+            if pos_embed.ndim == 2:
+                assert pos_embed.shape[0] == x.shape[1], (
+                    f"Unexpected positional_embedding length: {pos_embed.shape[0]} vs sequence {x.shape[1]}"
+                )
+                x = x + pos_embed
+            elif pos_embed.ndim == 3:
+                assert pos_embed.shape[1] == x.shape[1], (
+                    f"Unexpected positional_embedding length: {pos_embed.shape[1]} vs sequence {x.shape[1]}"
+                )
+                x = x + pos_embed
+            else:
+                raise ValueError(f"Unsupported positional_embedding shape: {pos_embed.shape}")
+            if hasattr(visual, "patch_dropout"):
+                x = visual.patch_dropout(x)
+            x = visual.ln_pre(x)
+
+            attn_mask = getattr(visual, "attn_mask", None)
+            if getattr(visual.transformer, "batch_first", True):
+                x = visual.transformer(x, attn_mask=attn_mask)
+            else:
+                x = x.permute(1, 0, 2)
+                x = visual.transformer(x, attn_mask=attn_mask)
+                x = x.permute(1, 0, 2)
+
+            if hasattr(visual, "ln_post"):
+                x = visual.ln_post(x)
+
+            patch_tokens = x[:, 1:, :]  # (B, H'*W', C)
+        return patch_tokens
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        images: Tensor of shape (B, 3, H, W), preprocessed with SigCLIP transforms.
+        Returns:
+        - prefix: Tensor of shape (B, num_tokens, d_model)
+        """
+        tokens = self._encode_patches(images)  # (B, N, C_clip)
+        B, N, C_clip = tokens.shape
+
+        H = self.grid_h
+        W = self.grid_w
+        assert N == H * W, f"Unexpected number of patch tokens: got {N}, expected {H * W}"
+
+        x = tokens.transpose(1, 2).reshape(B, C_clip, H, W)
+        if self.shuffle_factor > 1:
+            x = F.pixel_unshuffle(x, downscale_factor=self.shuffle_factor)
+            B, C_clip, H, W = x.shape
+
+        x = x.reshape(B, C_clip, H * W).transpose(1, 2)  # (B, num_tokens, C_clip * factor^2)
+        x = self.proj(x)  # (B, num_tokens, d_model)
+        return x
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.clip_model.eval()
+        return self
+
 
 class PatchVisionPrefixEncoder(nn.Module):
     """
@@ -308,4 +483,3 @@ class PatchVisionPrefixEncoder(nn.Module):
         B, C, H, W = x.shape
         x = x.view(B, C, H * W).transpose(1, 2)  # (B, num_tokens, d_model)
         return x
-

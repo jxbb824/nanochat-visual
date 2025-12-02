@@ -68,6 +68,10 @@ class MME(Task):
         if not completion:
             return False
 
+        # Lenient: if the completion contains the full correct string anywhere, count as correct.
+        if gt in completion:
+            return True
+
         idx_yes = completion.find("yes")
         idx_no = completion.find("no")
 
@@ -94,5 +98,4 @@ class MME(Task):
             pred = "no"
 
         return pred == gt
-
 

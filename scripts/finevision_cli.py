@@ -14,12 +14,25 @@ from contextlib import nullcontext
 
 from nanochat.common import compute_init, autodetect_device_type, get_base_dir
 from nanochat.gpt import GPT, GPTConfig
-from nanochat.vision import CLIPVisionPrefixEncoder, CLIPPatchVisionPrefixEncoder, PatchVisionPrefixEncoder
+from nanochat.vision import (
+    CLIPVisionPrefixEncoder,
+    CLIPPatchVisionPrefixEncoder,
+    SigCLIPPatchVisionPrefixEncoder,
+    PatchVisionPrefixEncoder,
+)
 
 
-def load_vlm_checkpoint(device, vlm_tag="d20_finevision"):
+def load_vlm_checkpoint(device, vlm_tag="d20_finevision", step=None):
     """
     Load the jointly finetuned VLM (GPT + vision) from vlm_checkpoints.
+    
+    Args:
+        device: torch device
+        vlm_tag: VLM checkpoint tag (directory name under vlm_checkpoints/)
+        step: Specific checkpoint step to load. If None, loads the latest checkpoint.
+    
+    Returns:
+        model, vision: Loaded model and vision encoder
     """
     base_dir = get_base_dir()
     vlm_ckpt_dir = os.path.join(base_dir, "vlm_checkpoints", vlm_tag)
@@ -27,8 +40,17 @@ def load_vlm_checkpoint(device, vlm_tag="d20_finevision"):
 
     ckpt_files = [f for f in os.listdir(vlm_ckpt_dir) if f.startswith("vlm_") and f.endswith(".pt")]
     assert ckpt_files, f"No vlm_*.pt checkpoints found in {vlm_ckpt_dir}"
-    last_step = max(int(f[4:10]) for f in ckpt_files)
-    ckpt_path = os.path.join(vlm_ckpt_dir, f"vlm_{last_step:06d}.pt")
+    
+    if step is not None:
+        # Load specific checkpoint step
+        ckpt_path = os.path.join(vlm_ckpt_dir, f"vlm_{step:06d}.pt")
+        assert os.path.exists(ckpt_path), f"Checkpoint at step {step} not found: {ckpt_path}"
+        print(f"Loading checkpoint from step {step}")
+    else:
+        # Load latest checkpoint (default behavior)
+        last_step = max(int(f[4:10]) for f in ckpt_files)
+        ckpt_path = os.path.join(vlm_ckpt_dir, f"vlm_{last_step:06d}.pt")
+        print(f"Loading latest checkpoint from step {last_step}")
 
     ckpt = torch.load(ckpt_path, map_location=device)
 
@@ -59,6 +81,14 @@ def load_vlm_checkpoint(device, vlm_tag="d20_finevision"):
             pool=user_config.get("vision_pool", 1),
             device=device,
         ).to(device)
+    elif vision_encoder_type == "sigclip_patch":
+        vision = SigCLIPPatchVisionPrefixEncoder(
+            d_model=model.config.n_embd,
+            model_name=user_config.get("vision_model_name", "ViT-SO400M-14-SigLIP"),
+            pretrained=user_config.get("vision_pretrained", "webli"),
+            shuffle_factor=user_config.get("vision_shuffle_factor", 2),
+            device=device,
+        ).to(device)
     elif vision_encoder_type == "patch":
         vision = PatchVisionPrefixEncoder(
             d_model=model.config.n_embd,
@@ -83,7 +113,7 @@ def build_visual_tokens(vision, image_path, device):
     return visual_tokens
 
 
-def generate_answer(model, tokenizer, question, visual_tokens, device, max_tokens=128, temperature=0.1, top_k=50):
+def generate_answer(model, tokenizer, question, visual_tokens, device, max_tokens=128, temperature=0.6, top_k=50):
     bos = tokenizer.get_bos_token_id()
     user_start = tokenizer.encode_special("<|user_start|>")
     user_end = tokenizer.encode_special("<|user_end|>")
@@ -124,6 +154,7 @@ def main():
     parser.add_argument("-i", "--image", type=str, required=True, help="Path to the image file")
     parser.add_argument("-q", "--question", type=str, required=True, help="User question about the image")
     parser.add_argument("--vlm-tag", type=str, default="d20_finevision", help="VLM checkpoint tag under vlm_checkpoints/")
+    parser.add_argument("--step", type=int, default=None, help="Specific checkpoint step to load. If not specified, loads the latest checkpoint.")
     parser.add_argument("--device-type", type=str, default="", choices=["cuda", "cpu", "mps"], help="Device type")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
     args = parser.parse_args()
@@ -138,7 +169,7 @@ def main():
     from nanochat.tokenizer import get_tokenizer
 
     tokenizer = get_tokenizer()
-    model, vision = load_vlm_checkpoint(device, vlm_tag=args.vlm_tag)
+    model, vision = load_vlm_checkpoint(device, vlm_tag=args.vlm_tag, step=args.step)
 
     with autocast_ctx:
         visual_tokens = build_visual_tokens(vision, args.image, device)
@@ -150,5 +181,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
